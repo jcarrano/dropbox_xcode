@@ -1,3 +1,5 @@
+# This work is licensed under the terms of the MIT license.
+# For a copy, see the file LICENSE in this directory
 """
 Dropbox music downloader
 ========================
