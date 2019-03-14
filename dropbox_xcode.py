@@ -576,7 +576,10 @@ def main():
 
     dbx = dropbox.Dropbox(token)
 
-    location = SyncLocation(dbx, ns.output, ns.remote)
+    destination_dir = (ns.output.joinpath(ns.remote.name)
+                       if ns.output.is_dir() else ns.output)
+
+    location = SyncLocation(dbx, destination_dir, ns.remote)
 
     all_items = tqdm.tqdm(iterable=location.findfiles(), unit="files",
                           desc="Scanning files", total=0)
