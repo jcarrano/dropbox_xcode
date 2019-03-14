@@ -393,10 +393,9 @@ class SyncLocation:
         followed by Dropbox hash.
         This is only defined for EXISTING destinations!!"""
         return ((not self.ignore_timestamps and (mdate(dest) > meta.date))
-                 or (_psize(dest) == meta.size
-                     and self._hash_local(dest) == meta.content_hash)
-                 )
-
+                or (_psize(dest) == meta.size
+                    and self._hash_local(dest) == meta.content_hash)
+                )
 
     def _audio_equality_test(self, meta: SimpleMetadata, dest: pathlib.Path):
         """Equality test for audio files in different formats. This only checks
