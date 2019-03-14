@@ -5,6 +5,13 @@ Dropbox music downloader
 This script simultaneously downloads and transcodes to OPUS entire directories
 from Dropbox. Only losslessly encoded files in FLAC are re-encoded.
 
+Special thanks to...
+--------------------
+
+...Dropbox, for making such awfully unpythonic SDK, and for providing zero (0)
+examples. The properties stuff is not an afterthought: you never thought about
+it before or after.
+
 A short side note
 -----------------
 
@@ -20,6 +27,7 @@ __copyright__ = "Copyright 2019 Juan I Carrano <juan@carrano.com.ar>"
 __license__ = "MIT"
 
 import argparse
+import abc
 import subprocess
 import datetime
 import os
@@ -29,6 +37,7 @@ import tempfile
 import asyncio
 import contextlib
 import itertools
+import functools
 import concurrent.futures
 import logging
 from typing import *
@@ -103,17 +112,29 @@ class DropboxHash:
         return this_copy
 
 
-class SimpleMetadata:
-    """Unifies Folder and File metadata, and drops useless properties."""
+class SimpleField(NamedTuple):
+    description: str
+    type: Callable[[str], Any]
+
+
+class SimpleMetadata(abc.ABC):
+    """Unifies Folder and File metadata, and drops useless properties. This
+    class should not be instantiated directly: instead, use the
+    SimpleMetadata.with_dbx() class factory."""
 
     MUSIC_EXTENSIONS = [".flac"]
+    TEMPLATE_NAME = "audiolength"
+    CUSTOM_FIELDS = {'audio_length': SimpleField('Audio duration in seconds',
+                                                 float)
+                     }
 
-    def __init__(self, dropbox_meta: DropboxMeta, parent_dir=None):
+    def __init__(self, dropbox_meta: DropboxMeta,
+                 parent_dir: Optional["SimpleMetadata"] = None):
         """Initialize the "reduced" metadata. The parent_dir should be a
         SimpleMetadata for the dropbox folder where this is located. It is used
         to correct dropbox's path case weirdness."""
+
         self.size = getattr(dropbox_meta, "size", None)
-        self.audio_length = getattr(dropbox_meta, "audio_length", None)
 
         # This works becaus the "path_display" property always has the last
         # component with the correct case, and because dropbox does not care
@@ -130,16 +151,31 @@ class SimpleMetadata:
                                  "this path.", parent_dir.path, _path)
 
             basename = _path.name
-            self.path = parent_dir.path.joinpath(basename)
+            self.path: pathlib.PurePosixPath = parent_dir.path.joinpath(
+                                                basename)
         else:
             self.path = _path
 
         if not self.folder:
             self.content_hash = dropbox_meta.content_hash
+            # important: use server modified. The other date could be a lie
             self.date = dropbox_meta.server_modified
+
+        self._custom = self._get_custom_propeties(dropbox_meta)
+
+        self._builtin_audio_length = getattr(dropbox_meta, "audio_length", None)
 
     def __str__(self):
         return str(self.path)
+
+    @property
+    @staticmethod
+    @abc.abstractmethod
+    def _dbx(self) -> dropbox.Dropbox:
+        """dropbox.Dropbox instance. This is needed to be able to fiddle with
+        properties. Declared as abstract so that instantiating SimpleMetadata
+        is forbidden."""
+        pass
 
     @property
     def folder(self) -> bool:
@@ -148,10 +184,148 @@ class SimpleMetadata:
         return self.size is None
 
     @property
+    def audio_length(self) -> Optional[float]:
+        """Get the length of an audio track, in seconds."""
+        return self._builtin_audio_length or self._custom.get("audio_length")
+
+    @audio_length.setter
+    def audio_length(self, length: float):
+        """Setting the audio length is only possible if Dropbox has not set the
+        field. This ensures there's only one audio length (for consistency)."""
+        if self._builtin_audio_length:
+            raise TypeError("Cannot set audio_length on a file that has it "
+                            "already set by Dropbox.")
+        else:
+            self._set_custom_prop("audio_length", length)
+
+    @property
     def music(self) -> bool:
         """Return True if the file is an audio file of a type that has to be
         transcoded."""
         return self.path.suffix.lower() in self.MUSIC_EXTENSIONS
+
+    def list_folder(self) -> Iterable["SimpleMetadata"]:
+        """List the contents of a directory. Use this instead of the dropbox
+        API since this takes care of correctly passing "parent_dir" to the
+        constructors as well as requesting the custom properties."""
+        # TODO: support recursive: bool=False (or maybe not)
+        if not self.folder:
+            raise ValueError("Only folders can be listed")
+
+        result = self._dbx.files_list_folder(
+                    str(self), include_property_groups=self._template_fiter())
+        this_class = type(self)
+
+        while True:
+            yield from (this_class(db_meta, parent_dir=self)
+                        for db_meta in result.entries)
+
+            if result.has_more:
+                result = self._dbx.files_list_folder_continue(result.cursor)
+            else:
+                break
+
+    def _set_custom_prop(self, key: str, value: Any) -> None:
+        """Low level function to set a custom property. Value will be
+        converted to string."""
+        if key not in self.CUSTOM_FIELDS:
+            raise ValueError("Unknown property: %s", key)
+
+        template_id = self.ensure_template()
+        prop = dropbox.file_properties.PropertyField(key, str(value))
+        update = dropbox.file_properties.PropertyGroupUpdate(template_id,
+                                                             [prop])
+        try:
+            self._dbx.files_properties_update(str(self), [update])
+        except dropbox.exceptions.ApiError as ex:
+            if not ex.error.is_property_group_lookup():
+                raise
+            else:
+                add = dropbox.file_properties.PropertyGroup(template_id,
+                                                            [prop])
+                self._dbx.files_properties_add(str(self), [add])
+
+        self._custom[key] = value
+
+    @classmethod
+    @functools.lru_cache(None)
+    def with_dbx(cls: Type["SimpleMetadata"],
+                 dbx: dropbox.Dropbox) -> Type["SimpleMetadata"]:
+        """Create a subclass of SimpleMetadata that has the dbx class attribute
+        defined. This method is infinitely cached so calling with the same dbx
+        should always give the same type object."""
+
+        class _SimpleMetadata(cls):
+            _dbx = dbx
+
+        return _SimpleMetadata
+
+    @classmethod
+    def _create_template(cls) -> str:
+        fields = [dropbox.file_properties.PropertyFieldTemplate(
+                        fname, fdef.description,
+                        dropbox.file_properties.PropertyType.string)
+                  for fname, fdef in cls.CUSTOM_FIELDS.items()]
+
+        r = cls._dbx.file_properties_templates_add_for_user(
+                        cls.TEMPLATE_NAME,
+                        "Store audio metadata for files that dropbox does not "
+                        "want to parse", fields)
+
+        return r.template_id
+
+    @classmethod
+    def _find_template(cls) -> Optional[str]:
+        """Find our template if it already defined"""
+        # dear Dropbox, screw your python bindings, a single monkey with a
+        # single typewriter would probably do better.
+        dbx = cls._dbx
+        tresults = dbx.file_properties_templates_list_for_user()
+        filtered = (tid for tid in tresults.template_ids
+                    if (dbx.file_properties_templates_get_for_user(tid).name
+                        == cls.TEMPLATE_NAME))
+
+        return next(filtered, None)
+
+    @classmethod
+    def ensure_template(cls):
+        """Create the dropbox property template if it does not exist and return
+        it's template ID."""
+        if not hasattr(cls, "_template_id"):
+            cls._template_id = cls._find_template() or cls._create_template()
+
+        return cls._template_id
+
+    @classmethod
+    def _template_fiter(cls):
+        """Get a Dropbox template filter for our custom properties."""
+        template_id = cls.ensure_template()
+        return dropbox.file_properties.TemplateFilterBase.filter_some(
+                    [template_id])
+
+    @classmethod
+    def from_path(cls, path: Union[str, pathlib.PurePosixPath],
+                  **kwargs) -> "SimpleMetadata":
+        """Get the metadata for the file pointed to by path."""
+
+        db_meta = cls._dbx.files_get_metadata(
+                    str(path), include_property_groups=cls._template_fiter())
+
+        return cls(db_meta, **kwargs)
+
+    @classmethod
+    def _get_custom_propeties(cls,
+                              dropbox_meta: DropboxMeta) -> Dict['str', Any]:
+        """Get our custom properties as a dictionary"""
+        template_id = cls.ensure_template()
+        our_props = next(
+            (propgroup.fields
+             for propgroup in (dropbox_meta.property_groups or ())
+             if propgroup.template_id == template_id),
+            ())
+
+        return {prop.name: cls.CUSTOM_FIELDS[prop.name].type(prop.value)
+                for prop in our_props}
 
 
 def mdate(path: pathlib.Path) -> datetime.datetime:
@@ -167,7 +341,9 @@ def _psize(path: pathlib.Path) -> int:
 def audio_meta(path: pathlib.Path) -> Tuple[float, int]:
     """Get the duration in seconds and the bitrate of audio file."""
     audioinfo = mutagen.File(path).info
-    return audioinfo.length, getattr(audioinfo, "bitrate", None)
+    # mutagen returns None if the file is not audio
+    return (audioinfo.length, getattr(audioinfo, "bitrate", None)
+            if audioinfo else (0, None))
 
 
 SyncSpec = Tuple[SimpleMetadata, pathlib.Path]
@@ -212,17 +388,21 @@ class SyncLocation:
 
         return hasher.hexdigest()
 
-    @staticmethod
-    def _equality_test():
+    def _equality_test(self, meta: SimpleMetadata, dest: pathlib.Path):
         """Equality test for files that are not audio files. Test file size,
-        followed by Dropbox hash."""
-        pass
+        followed by Dropbox hash.
+        This is only defined for EXISTING destinations!!"""
+        return ((not self.ignore_timestamps and (mdate(dest) > meta.date))
+                 or (_psize(dest) == meta.size
+                     and self._hash_local(dest) == meta.content_hash)
+                 )
 
-    @staticmethod
-    def _audio_equality_test(meta: SimpleMetadata, dest: pathlib.Path):
+
+    def _audio_equality_test(self, meta: SimpleMetadata, dest: pathlib.Path):
         """Equality test for audio files in different formats. This only checks
         that the files have the same length (it tolerates up to 0.5 seconds
         difference."""
+        # FIXME: i don't quite remember why i'm not testing timestamp
         remote_duration = meta.audio_length
         return (False if not remote_duration
                 else abs(remote_duration - audio_meta(dest)[0]) <= 0.5)
@@ -245,42 +425,29 @@ class SyncLocation:
         if meta.folder:
             synced = dest.is_dir()
         elif dest.is_file():
-            synced = ((not self.ignore_timestamps and (mdate(dest) > meta.date))
-                      or (_psize(dest) == meta.size
-                          and self._hash_local(dest) == meta.content_hash)
-                      )
+            synced = (self._equality_test(meta, dest) if not meta.music
+                      else self._audio_equality_test(meta, dest))
         else:
 
             synced = False
 
         return synced, dest
 
-    def _list_folder(self, dir_meta: SimpleMetadata) -> Iterable[SimpleMetadata]:
-        result = self.dbx.files_list_folder(str(dir_meta))
-
-        while True:
-            yield from (SimpleMetadata(meta, parent_dir=dir_meta)
-                        for meta in result.entries)
-
-            if result.has_more:
-                result = self.dbx.files_list_folder_continue(result.cursor)
-            else:
-                break
-
     def findfiles(self) -> Iterable[SimpleMetadata]:
         """Recursively list all files in a dropbox folder."""
 
         # We cannot use recursive=True because we must keep track of parent
         # directories
-        root_dir = SimpleMetadata(
-                    self.dbx.files_get_metadata(str(self.remote_root)))
+        _SimpleMetadata = SimpleMetadata.with_dbx(self.dbx)
+
+        root_dir = _SimpleMetadata.from_path(self.remote_root)
 
         yield root_dir
 
         pending_folders = [root_dir]
 
         while pending_folders:
-            contents = list(self._list_folder(pending_folders.pop()))
+            contents = list(pending_folders.pop().list_folder())
 
             pending_folders.extend(d for d in contents if d.folder)
 
@@ -378,7 +545,7 @@ class NopSynchronizer:
         # worry about catching the StopIteration exception
         _files = itertools.chain(files, itertools.repeat((None, None)))
         _music = itertools.chain(music, itertools.repeat((None, None)))
-        running_tasks = []
+        running_tasks = []  # type: List[asyncio.Task]
 
         while True:
             await self._dl_limiter.acquire()
@@ -460,12 +627,18 @@ class Synchronizer(NopSynchronizer):
     def _ensure_dir(self, dest: pathlib.Path) -> None:
         os.makedirs(dest.parent, exist_ok=True)
 
-    def _download(self, meta: SimpleMetadata, dest: pathlib.Path):
+    async def _download(self, meta: SimpleMetadata, dest: pathlib.Path):
         loop = self._loop or asyncio.get_running_loop()
-        return loop.run_in_executor(self._dl_executor,
-                                    self.dbx.files_download_to_file,
-                                    str(dest),
-                                    str(meta.path))
+        await loop.run_in_executor(self._dl_executor,
+                                   self.dbx.files_download_to_file,
+                                   str(dest),
+                                   str(meta))
+        if meta.music:
+            computed_length, _ = audio_meta(dest)
+            remote_len = meta.audio_length
+            # FIXME: move this criteria somewhere else
+            if not remote_len or abs(remote_len - computed_length) > 0.1:
+                meta.audio_length = computed_length
 
     async def _transcode(self, input: pathlib.Path, output: pathlib.Path,
                          bitrate: int = 160):
@@ -530,7 +703,8 @@ def main():
                               type=argparse.FileType())
 
     parser.add_argument('-n', '--dry-run', help="List the remote directory and "
-                        "what would be done", default=False,
+                        "what would be done. NOTE: dry run will create a "
+                        "property group template in Dropbox!", default=False,
                         action="store_true")
 
     parser.add_argument('-o', '--output', help="Store files to this output "
