@@ -516,6 +516,7 @@ class NopSynchronizer:
         # new tasks if there is a download slot open. We use a simple counter.
         self._xcode_limiter = max_transcode
         self._loop = None
+        self._critical_error = False
 
     @staticmethod
     @contextlib.contextmanager
@@ -548,7 +549,7 @@ class NopSynchronizer:
         _music = itertools.chain(music, itertools.repeat((None, None)))
         running_tasks = []  # type: List[asyncio.Task]
 
-        while True:
+        while not self._critical_error:
             await self._dl_limiter.acquire()
 
             this_music, music_dst = (next(_music) if self._xcode_limiter > 0
@@ -583,9 +584,6 @@ class NopSynchronizer:
         _download() that posts to the download semaphore after it is done."""
         try:
             await self._download(meta, dest)
-        except dropbox.exceptions.ApiError:
-            logging.exception("Failed to download file %s", str(meta))
-            raise
         finally:
             self._dl_limiter.release()
 
@@ -621,6 +619,9 @@ class Synchronizer(NopSynchronizer):
         """
         handle, fn = tempfile.mkstemp(*args, **kwargs)
         try:
+            # if we don't close the handle the descriptor will be leaked and
+            # we will run out of disk space in tmpfs
+            os.close(handle)
             yield fn
         finally:
             os.remove(fn)
@@ -630,10 +631,21 @@ class Synchronizer(NopSynchronizer):
 
     async def _download(self, meta: SimpleMetadata, dest: pathlib.Path):
         loop = self._loop or asyncio.get_running_loop()
-        await loop.run_in_executor(self._dl_executor,
-                                   self.dbx.files_download_to_file,
-                                   str(dest),
-                                   str(meta))
+
+        try:
+            await loop.run_in_executor(self._dl_executor,
+                                       self.dbx.files_download_to_file,
+                                       str(dest),
+                                       str(meta))
+        except dropbox.exceptions.ApiError:
+            logging.exception("Failed to download file %s", str(meta))
+            raise
+        except OSError:
+            # OS errors are likely to be irrecoverable
+            logging.exception("OS error while downloading file %s", str(meta))
+            self._critical_error = True
+            raise
+
         if meta.music:
             computed_length, _ = audio_meta(dest)
             remote_len = meta.audio_length
@@ -668,16 +680,27 @@ class Synchronizer(NopSynchronizer):
             return False
 
 
-def set_tempdir(path: Union[pathlib.Path, None]) -> None:
-    """Set the tempfile module's tempdir to the user choice, or attempt to
+def get_tempdir(path: Optional[pathlib.Path]) -> str:
+    """Get the name of the tempdir according to user's choice, or attempt to
     use a tmpfs."""
     if path:
-        tempfile.tempdir = str(path.resolve())
+        return str(path.resolve())
     elif os.name == "posix" and not os.environ.keys() & ("TMPDIR", "TEMP",
                                                          "TMP"):
         tmpfs = pathlib.Path("/run/user/{}".format(os.getuid()))
         if tmpfs.is_dir():
-            tempfile.tempdir = str(tmpfs)
+            return str(tmpfs)
+
+    return tempfile.gettempdir()
+
+
+@contextlib.contextmanager
+def set_tempdir(path: pathlib.Path):
+    """Set the tempfile module's tempdir and unset it on exit."""
+    old_tmpdir = tempfile.gettempdir()
+    tempfile.tempdir = path
+    yield
+    tempfile.tempdir = old_tmpdir
 
 
 class TQDMHandler(logging.Handler):
@@ -743,7 +766,6 @@ def main():
               "option or by placing it at {}".format(DEFAULT_TOKEN_FILE))
         return 1
 
-    set_tempdir(ns.tmpdir)
     logging.getLogger().addHandler(TQDMHandler())
 
     if ns.logfile:
@@ -773,7 +795,13 @@ def main():
     synch = synch_class(dbx)
 
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(synch.sync_all(file_w_progress, music_w_progress))
+
+    tmpdir0 = get_tempdir(ns.tmpdir)
+    with tempfile.TemporaryDirectory(
+            prefix="dbx_xcode.",
+            dir=tmpdir0) as dirname, set_tempdir(dirname):
+        loop.run_until_complete(synch.sync_all(file_w_progress,
+                                               music_w_progress))
 
     print()  # ensure the progress bar does not get deleted
     return 0
