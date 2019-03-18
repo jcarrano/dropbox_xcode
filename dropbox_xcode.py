@@ -605,6 +605,10 @@ class NopSynchronizer:
                 self._xcode_limiter += 1
 
 
+class TranscodeError(Exception):
+    """Errors raised by the opusenc program."""
+
+
 class Synchronizer(NopSynchronizer):
     """Real (wet run) synchronizer."""
     def __init__(self, *args, **kwargs):
@@ -667,6 +671,7 @@ class Synchronizer(NopSynchronizer):
 
         if process.returncode:
             logging.error("Error transcoding file: %s.", out)
+            raise TranscodeError(out.strip())
 
     @staticmethod
     def check_opusenc() -> bool:
@@ -698,7 +703,7 @@ def get_tempdir(path: Optional[pathlib.Path]) -> str:
 def set_tempdir(path: pathlib.Path):
     """Set the tempfile module's tempdir and unset it on exit."""
     old_tmpdir = tempfile.gettempdir()
-    tempfile.tempdir = path
+    tempfile.tempdir = str(path)
     yield
     tempfile.tempdir = old_tmpdir
 
