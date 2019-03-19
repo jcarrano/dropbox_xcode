@@ -403,7 +403,9 @@ class SyncLocation:
         """Equality test for audio files in different formats. This only checks
         that the files have the same length (it tolerates up to 0.5 seconds
         difference."""
-        # FIXME: i don't quite remember why i'm not testing timestamp
+        # Checking the timestamp is a bad idea because the file is newly created
+        # when it's synced and because we we will eventually edit tags (esp
+        # playcount)
         remote_duration = meta.audio_length
         return (False if not remote_duration
                 else abs(remote_duration - audio_meta(dest)[0]) <= 0.5)
