@@ -47,6 +47,7 @@ from typing import *
 import dropbox
 import tqdm
 import mutagen
+import mutagen.id3
 
 DEFAULT_TOKEN_FILE = pathlib.Path.home().joinpath(".dropbox_xcode_token")
 
@@ -346,6 +347,17 @@ def audio_meta(path: pathlib.Path) -> Tuple[float, int]:
     # mutagen returns None if the file is not audio
     return (audioinfo.length, getattr(audioinfo, "bitrate", None)
             if audioinfo else (0, None))
+
+
+def _id3_strip(path: pathlib.Path) -> None:
+    """Strip ID3 tags from a FLAC files. opusenc refuses to encode files with
+    id3 tags. If the file does not have tags, it is left as is."""
+    try:
+        id3file = mutagen.id3.ID3(path)
+    except mutagen.MutagenError:
+        pass
+    else:
+        id3file.delete()
 
 
 SyncSpec = Tuple[SimpleMetadata, pathlib.Path]
@@ -677,6 +689,8 @@ class Synchronizer(NopSynchronizer):
 
     async def _transcode(self, input: pathlib.Path, output: pathlib.Path,
                          bitrate: int = 160):
+        """Remove all ID3 tags from the file and call opusenc."""
+        _id3_strip(input)
 
         cmdline = ["opusenc", "--quiet", "--music", "--bitrate", str(bitrate),
                    str(input), str(output)]

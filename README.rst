@@ -39,6 +39,15 @@ Features
 
 Also, check out the implementation of the "Dropbox Hash" and steal it.
 
+Notes
+=====
+
+You will need to have ``opusenc`` (from ``opus-tools``) installed.
+
+``opusenc`` does not like ID3 tags so this script removes them prior to
+conversion. The information in the ID3 tags is **discarded**. In any case, you
+should not be using id3 in FLAC files.
+
 Why?
 ====
 

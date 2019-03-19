@@ -6,7 +6,7 @@ def readme():
         return f.read()
 
 setup(name='dropbox-xcode',
-      version='0.2.1',
+      version='0.2.2',
       description='Download and transcode audio files from Dropbox',
       long_description=readme(),
       classifiers=[
