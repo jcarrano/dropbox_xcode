@@ -491,6 +491,21 @@ class SyncLocation:
 # of scheduler, which chooses between downloading normal or music files
 # depending on the transcoding load.
 
+
+def _filter_active(tasks: Iterable[asyncio.Future]) -> Iterable[asyncio.Future]:
+    """Given a list of tasks, return those that are still active, and for
+    those that are done, retrieve the exception so that we don't get a
+    warning."""
+
+    for task in tasks:
+        if task.done():
+            exc = task.exception()
+            if exc:
+                logging.info("Discarded exception", exc_info=exc)
+        else:
+            yield task
+
+
 class NopSynchronizer:
     """No-operation synchronizer, used for dry-runs.
 
@@ -547,7 +562,7 @@ class NopSynchronizer:
         # worry about catching the StopIteration exception
         _files = itertools.chain(files, itertools.repeat((None, None)))
         _music = itertools.chain(music, itertools.repeat((None, None)))
-        running_tasks = []  # type: List[asyncio.Task]
+        running_tasks = []  # type: List[asyncio.Future]
 
         while not self._critical_error:
             await self._dl_limiter.acquire()
@@ -572,12 +587,14 @@ class NopSynchronizer:
             self._ensure_dir(sync_dest)
             sync_fn = self.sync_file if this_file else self.sync_music
 
-            running_tasks = [t for t in running_tasks if not t.done()]
+            running_tasks = list(_filter_active(running_tasks))
             running_tasks.append(asyncio.create_task(
                                  sync_fn(sync_meta, sync_dest)))
 
         if running_tasks:
-            await asyncio.wait(running_tasks)
+            done, pending = await asyncio.wait(running_tasks)
+            # retrieve exceptions
+            _filter_active(done)
 
     async def sync_file(self, meta: SimpleMetadata, dest: pathlib.Path):
         """Download a file (no transcoding). This is just a wrapper for
