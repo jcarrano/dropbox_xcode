@@ -601,12 +601,11 @@ class NopSynchronizer:
             self._xcode_limiter -= 1
             try:
                 await self._transcode(fn, dest)
+            except Exception:
+                logging.exception("Error transcoding file: %s", meta)
+                raise
             finally:
                 self._xcode_limiter += 1
-
-
-class TranscodeError(Exception):
-    """Errors raised by the opusenc program."""
 
 
 class Synchronizer(NopSynchronizer):
@@ -665,13 +664,13 @@ class Synchronizer(NopSynchronizer):
 
         process = await asyncio.create_subprocess_exec(
                     *cmdline, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT)
+                    stderr=asyncio.subprocess.PIPE)
 
         out, err = await process.communicate()
 
         if process.returncode:
-            logging.error("Error transcoding file: %s.", out)
-            raise TranscodeError(out.strip())
+            raise subprocess.CalledProcessError(process.returncode, cmdline,
+                                                out, err)
 
     @staticmethod
     def check_opusenc() -> bool:
