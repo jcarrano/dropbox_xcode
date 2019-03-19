@@ -745,6 +745,13 @@ def main():
     parser.add_argument('--logfile', help="Save logs to file",
                         type=pathlib.Path)
 
+    parser.add_argument('--limit-files', metavar='N', help="Only scan the "
+                        "first N files (for faster debugging)", type=int)
+
+    parser.add_argument('--exclude', metavar="GLOB", help="Exclude files "
+                        "based on a glob expression (can be specified multiple "
+                        "times", action='append', default=[])
+
     parser.add_argument('remote', help="Remote (dropbox) directory to download",
                         type=pathlib.PurePosixPath)
 
@@ -782,10 +789,14 @@ def main():
 
     location = SyncLocation(dbx, destination_dir, ns.remote)
 
-    all_items = tqdm.tqdm(iterable=location.findfiles(), unit="files",
+    listing = itertools.islice(location.findfiles(), ns.limit_files)
+    all_items = tqdm.tqdm(iterable=listing, unit="files",
                           desc="Scanning files", total=0)
 
-    _, file_syncs, music_syncs = location.fileclassify(all_items)
+    filtered_items = (item for item in all_items
+                      if not any(item.path.match(g) for g in ns.exclude))
+
+    _, file_syncs, music_syncs = location.fileclassify(filtered_items)
 
     print(len(file_syncs), "regular files out of sync")
     print(len(music_syncs), "audio tracks out of sync")
